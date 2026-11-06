@@ -1,0 +1,14 @@
+# 编译产物
+build/
+
+# clangd 缓存
+.cache/
+
+# 编辑器配置
+.vscode/
+
+# Windows 下载标记文件
+*:Zone.Identifier
+
+# 大视频先不传（59MB）
+assets/videos/
