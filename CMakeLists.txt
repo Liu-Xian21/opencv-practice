@@ -17,7 +17,7 @@ file(COPY ${CMAKE_SOURCE_DIR}/assets/models/ DESTINATION ${CMAKE_BINARY_DIR})
 include_directories(${OpenCV_INCLUDE_DIRS})
 
 # 生成可执行文件：名字叫demo，源码是main.cpp
-add_executable(demo src/OpenCV练习.cpp)
+add_executable(demo src/红绿灯识别.cpp)
 
 # 链接OpenCV库
 target_link_libraries(demo ${OpenCV_LIBS})

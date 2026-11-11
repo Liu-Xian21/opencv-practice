@@ -71,42 +71,33 @@ void find_minmaxLoc(Mat &img,Mat &imgGray)
     circle(img, maxLoc, 15, Scalar(0, 0, 255), 2);   // 红色 = 最大值
     circle(img, minLoc, 15, Scalar(255, 0, 0), 2);   // 蓝色 = 最小值
 }
-    //Mat mean,stddev;
-    // meanStdDev(imgGray, mean, stddev);
-    // double meanV = mean.at<double>(0, 0);
-    // double stdV  = stddev.at<double>(0, 0);
-    // cout << "Mean: " << meanV << endl;
-    // cout << "Standard Deviation: " << stdV << endl;      求均值和方差
-        // flip(img,img_x,1);
-    // flip(img,img_y,0);
-    // flip(img,img_xy,-1);
-    // imshow("Original Image", img);
-    // imshow("Flipped Image (X-axis)", img_x);
-    // imshow("Flipped Image (Y-axis)", img_y);
-    // imshow("Flipped Image (XY-axis)", img_xy);
-// int main()
-// {
-//     Mat img= imread("1.jpg");
-//     Mat imgGray,img_x,img_y,img_xy;
-//     if(img.empty())
-//     {
-//         cout<<"Error: Could not read image file."<<endl;
-//         return -1;
-//     }
-//     cvtColor(img,imgGray,COLOR_BGR2GRAY);
-
-//     waitKey(0);
-//     destroyAllWindows();
-// }
-struct Frame{
-    int id;
-    int width;
-    int height;
-    vector<uint8_t> pixels;
-    int frame;
-
+void find_meanStdDev(Mat &img,Mat &imgGray)
+{
+    Mat mean,stddev,img_x,img_y,img_xy;
+    meanStdDev(imgGray, mean, stddev);
+    double meanV = mean.at<double>(0, 0);
+    double stdV  = stddev.at<double>(0, 0);
+    cout << "Mean: " << meanV << endl;
+     cout << "Standard Deviation: " << stdV << endl;      //求均值和方差
+        flip(img,img_x,1);  //flipCode=1表示水平翻转，flipCode=0表示垂直翻转，
+                                               //flipCode=-1表示水平和垂直翻转
+    flip(img,img_y,0);
+    flip(img,img_xy,-1);
+    imshow("Original Image", img);
+    imshow("Flipped Image (X-axis)", img_x);
+    imshow("Flipped Image (Y-axis)", img_y);
+    imshow("Flipped Image (XY-axis)", img_xy);
 }
+
 int main()
 {
-    Frame&frame = 
+    Mat img= imread("1.jpg");
+    Mat img1 = img.clone();
+    Rect roi(100, 100, 200, 200); // 定义感兴趣区域
+    Mat roiImg = img(roi); // 提取感兴趣区域
+    imshow("Original Image", img);
+    imshow("ROI Image", roiImg);
+
+    waitKey(0);
+    destroyAllWindows();
 }
