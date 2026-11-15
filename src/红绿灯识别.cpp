@@ -1,90 +1,208 @@
 #include <iostream>
-#include <opencv2/core.hpp>
-#include <opencv2/core/mat.hpp>
-#include <opencv2/videoio.hpp>
-#include <vector>
 #include <opencv2/opencv.hpp>
+#include <vector>
 #include <string>
+#include <algorithm>
+
+#include "SerialPort.h"
+
 using namespace std;
 using namespace cv;
-struct Blob 
-{   
+
+// ===================== Blob =====================
+struct Blob {
     Rect box;
     double area = 0;
     bool found = false;
 };
 
-Blob findBlobByBBox(const Mat& mask, int minArea)        
+Blob findBlobByBBox(const Mat& mask, int minArea)
 {
-    Blob result; 
+    Blob result;
     vector<Point> pts;
-    findNonZero(mask, pts);       
+    findNonZero(mask, pts);
     if (pts.empty()) return result;
 
-    Rect box = boundingRect(pts);     
+    Rect box = boundingRect(pts);
     double area = countNonZero(mask);
-    if (area > minArea)
-    {
+    if (area > minArea) {
         result.found = true;
         result.area  = area;
-        result.box = box;
+        result.box   = box;
     }
     return result;
 }
 
-enum class LightState
-{
-    Unknown,
-    Red,
-    Green,
-    Yellow
+// ===================== Detection =====================
+struct Detection {
+    LightState raw = LightState::Unknown;
+    double confidence = 0.0;
+    Rect box;
+    const char* reason = "unknown";
 };
+
+Detection decide(const Blob& red, const Blob& green, const Blob& yellow, int minArea)
+{
+    Detection d;
+
+    struct Cand { bool ok; LightState s; double area; const Blob* b; };
+    Cand cands[3] = {
+        {red.found    && red.area    > minArea, LightState::Red,    red.area,    &red},
+        {green.found  && green.area  > minArea, LightState::Green,  green.area,  &green},
+        {yellow.found && yellow.area > minArea, LightState::Yellow, yellow.area, &yellow}
+    };
+
+    Cand* best = nullptr;
+    Cand* second = nullptr;
+    for (auto& c : cands) {
+        if (!c.ok) continue;
+        if (!best || c.area > best->area) { second = best; best = &c; }
+        else if (!second || c.area > second->area) { second = &c; }
+    }
+
+    if (!best) { d.reason = "no blob"; return d; }
+
+    // 主色优势：最大 / 次大 必须 >= 1.5
+    if (second && best->area / second->area < 1.5) {
+        d.reason = "color ambiguous";
+        return d;
+    }
+
+    d.raw = best->s;
+    d.box = best->b->box;
+    d.confidence = second ? 1.0 - second->area / best->area : 1.0;
+    d.reason = "ok";
+    return d;
+}
+
+// ===================== SequenceValidator =====================
+class SequenceValidator {
+public:
+    explicit SequenceValidator(double holdSec = 0.15,
+                               double graceSec = 0.50,
+                               double unknownTimeoutSec = 1.0,
+                               double longHoldSec = 0.60)
+        : holdSec_(holdSec), graceSec_(graceSec),
+          unknownTimeoutSec_(unknownTimeoutSec), longHoldSec_(longHoldSec) {}
+
+    LightState update(LightState detected, double nowSec)
+    {
+        // 1. 没检测到：短暂宽限，长期超时
+        if (detected == LightState::Unknown) {
+            if (nowSec - lastValidTime_ < graceSec_)
+                return confirmed_;
+            if (nowSec - lastValidTime_ > unknownTimeoutSec_)
+                setConfirmed(LightState::Unknown, nowSec);
+            return confirmed_;
+        }
+
+        lastValidTime_ = nowSec;
+
+        // 2. 启动：第一个稳定检测直接接受
+        if (confirmed_ == LightState::Unknown)
+            return tryConfirm(detected, nowSec, holdSec_);
+
+        // 3. 和当前一致：保持
+        if (detected == confirmed_) {
+            candidate_ = detected;
+            candidateSince_ = nowSec;
+            return confirmed_;
+        }
+
+        // 4. 符合序列：正常切换
+        if (detected == nextState(confirmed_))
+            return tryConfirm(detected, nowSec, holdSec_);
+
+        // 5. 非法跳变：先忽略；持续 longHoldSec 才容忍
+        return tryConfirm(detected, nowSec, longHoldSec_);
+    }
+
+    double stateAge(double nowSec) const { return nowSec - stateSince_; }
+
+    // 距离"红灯开始"的最短/最长剩余时间（规则：绿 3~5s，黄 2s）
+    double timeUntilRedMin(double nowSec) const
+    {
+        double age = stateAge(nowSec);
+        switch (confirmed_) {
+            case LightState::Green:  return std::max(0.0, 3.0 - age) + 2.0;
+            case LightState::Yellow: return std::max(0.0, 2.0 - age);
+            case LightState::Red:    return 0.0;
+            default:                 return 0.0;
+        }
+    }
+
+    double timeUntilRedMax(double nowSec) const
+    {
+        double age = stateAge(nowSec);
+        switch (confirmed_) {
+            case LightState::Green:  return std::max(0.0, 5.0 - age) + 2.0;
+            case LightState::Yellow: return std::max(0.0, 2.0 - age);
+            case LightState::Red:    return 0.0;
+            default:                 return 0.0;
+        }
+    }
+
+    // 只有"亲眼看到绿灯开始"且剩余时间足够，才允许起步
+    bool safeToGo(double nowSec, double requiredSec) const
+    {
+        if (confirmed_ != LightState::Green) return false;
+        if (!stateKnownFromStart_) return false;
+        return timeUntilRedMin(nowSec) >= requiredSec;
+    }
+
+private:
+    void setConfirmed(LightState s, double nowSec)
+    {
+        if (confirmed_ == s) return;
+
+        bool fromTransition = (confirmed_ != LightState::Unknown);
+        confirmed_ = s;
+        stateSince_ = nowSec;
+        stateKnownFromStart_ = fromTransition;
+    }
+
+    LightState tryConfirm(LightState detected, double nowSec, double hold)
+    {
+        if (detected != candidate_) {
+            candidate_ = detected;
+            candidateSince_ = nowSec;
+        }
+        if (nowSec - candidateSince_ >= hold)
+            setConfirmed(detected, nowSec);
+        return confirmed_;
+    }
+
+    static LightState nextState(LightState s)
+    {
+        switch (s) {
+            case LightState::Red:    return LightState::Green;
+            case LightState::Green:  return LightState::Yellow;
+            case LightState::Yellow: return LightState::Red;
+            default:                 return LightState::Unknown;
+        }
+    }
+
+    double holdSec_, graceSec_, unknownTimeoutSec_, longHoldSec_;
+    LightState confirmed_ = LightState::Unknown;
+    LightState candidate_ = LightState::Unknown;
+    double candidateSince_ = 0.0;
+    double lastValidTime_ = 0.0;
+    double stateSince_ = 0.0;
+    bool stateKnownFromStart_ = false;
+};
+
+// ===================== toString =====================
 const char* toString(LightState s)
 {
     switch (s) {
-        case LightState::Unknown: return "UNKNOWN";
-        case LightState::Red:     return "RED";
-        case LightState::Green:   return "GREEN";
-        case LightState::Yellow:  return "YELLOW";
+        case LightState::Red:    return "RED";
+        case LightState::Green:  return "GREEN";
+        case LightState::Yellow: return "YELLOW";
+        default:                 return "UNKNOWN";
     }
-    return "UNKNOWN";
 }
 
-// ostream& operator<<(std::ostream& os, LightState s)
-// {
-//     return os << toString(s);
-// }
-class TimeDebouncer
-{
-    private:
-    double holdSec_;
-    double candidateSince_ = 0.0;
-    LightState confirmed_ =LightState::Unknown;
-    LightState candidate_ = LightState::Unknown;
-
-    public:
-    explicit TimeDebouncer(double holdSec = 0.15) : holdSec_(holdSec) {}
-
-    //string update(const string& raw, double nowSec)
-    LightState update(LightState raw, double nowSec)     
-    {
-        if (raw != candidate_) 
-        {
-            candidate_ = raw;
-            candidateSince_ = nowSec;
-        }
-        if (nowSec - candidateSince_ >= holdSec_)
-        {
-            confirmed_ = candidate_;
-        }
-        return confirmed_;
-    }
-    LightState confirmed() const { return confirmed_; }
-    LightState candidate() const { return candidate_; }
-
-};
-
-
+// ===================== Morphology =====================
 void Morphology(Mat& mask)
 {
     Mat kernel = getStructuringElement(MORPH_RECT, Size(5, 5));
@@ -93,112 +211,122 @@ void Morphology(Mat& mask)
     erode(temp, mask, kernel);
 }
 
+// ===================== main =====================
 int main()
-{ 
+{
+    // 1. 串口（必须放 main 里）
+    SerialPort serial;
+    if (!serial.openPort("/dev/ttyUSB0", 115200)) {
+        cerr << "串口打开失败，继续只显示\n";
+    }
 
-    //连接手机的
-    // const string url = "http://10.163.62.219:8080/video";
-    // vector<int> params = {
-    //     cv::CAP_PROP_OPEN_TIMEOUT_MSEC, 5000,
-    //     cv::CAP_PROP_READ_TIMEOUT_MSEC, 5000
-    // };
-    // VideoCapture cap(url, cv::CAP_FFMPEG, params);
-    // if (!cap.isOpened()) {
-    //     std::cerr << "Error1\n";
-    //     return -1;
-    // }
-    // cout << "已连接: " << cap.get(cv::CAP_PROP_FRAME_WIDTH) << "x"
-    //           << cap.get(cv::CAP_PROP_FRAME_HEIGHT) << "\n";
-
+    // 2. 视频
     VideoCapture cap("/home/liu_xian/sample/assets/videos/practice.mp4");
-    if (!cap.isOpened())
-    {
-	    cout << "Error2" << endl;
-	    return -1;
+    if (!cap.isOpened()) {
+        cerr << "视频打开失败\n";
+        return -1;
     }
 
     Mat imgroi, img;
-    const int TARGET_W = 640; 
+    const int TARGET_W = 640;
     double fps = 0.0;
-    int64 t0 = cv::getTickCount();
+    int64 t0 = getTickCount();
+    int readFail = 0;
 
-    TimeDebouncer debounce(0.15); 
-    while (true) 
+    // 车从停车点到"完全进入隧道"的实测时间（秒），先填 2.0，之后按实车改
+    const double t_cross = 2.0;
+
+    SequenceValidator validator;   // 0.15 / 0.50 / 1.0 / 0.60
+
+    while (true)
     {
-        if (!cap.read(imgroi) || imgroi.empty()) 
-        {
-            std::cerr << "读帧失败\n";
-            break;
+        if (!cap.read(imgroi) || imgroi.empty()) {
+            sendTrafficLight(serial, LightState::Unknown, false);
+            if (++readFail > 30) break;   // 视频结束/相机断开
+            continue;
         }
+        readFail = 0;
 
         double s = static_cast<double>(TARGET_W) / imgroi.cols;
-        cv::resize(imgroi, img, cv::Size(), s, s,INTER_AREA);
-        Rect roi(static_cast<int>(img.cols * 0.10),static_cast<int>(img.rows * 0.10),static_cast<int>(img.cols * 0.80),static_cast<int>(img.rows * 0.80));
-        roi &= Rect(0,0,img.cols,img.rows);     //暂定，尝试使用动态roi
-        Mat imgHSV;
-        GaussianBlur(img, img, Size(5, 5), 0);
-        cvtColor(img, imgHSV, COLOR_BGR2HSV);
+        resize(imgroi, img, Size(), s, s, INTER_AREA);
 
-        Mat maskRed,maskRed_1,maskRed_2,maskGreen,maskYellow;
-        inRange(imgHSV, Scalar(0,   130, 120), Scalar(8,   255, 255), maskRed_1);
-        inRange(imgHSV, Scalar(172, 130, 120), Scalar(180, 255, 255), maskRed_2);
-        bitwise_or(maskRed_1, maskRed_2, maskRed);
-        inRange(imgHSV, Scalar(15, 150, 120), Scalar(38, 255, 255), maskYellow);
-        inRange(imgHSV, Scalar(40, 80, 80), Scalar(95, 255, 255), maskGreen);
-        
+        // 3. ROI
+        Rect roi(static_cast<int>(img.cols * 0.10),
+                 static_cast<int>(img.rows * 0.10),
+                 static_cast<int>(img.cols * 0.80),
+                 static_cast<int>(img.rows * 0.80));
+        roi &= Rect(0, 0, img.cols, img.rows);
+        Mat imgROI = img(roi).clone();
+
+        Mat hsv;
+        GaussianBlur(imgROI, imgROI, Size(5, 5), 0);
+        cvtColor(imgROI, hsv, COLOR_BGR2HSV);
+
+        Mat maskRed1, maskRed2, maskRed, maskGreen, maskYellow;
+        inRange(hsv, Scalar(0,   130, 120), Scalar(8,   255, 255), maskRed1);
+        inRange(hsv, Scalar(172, 130, 120), Scalar(180, 255, 255), maskRed2);
+        bitwise_or(maskRed1, maskRed2, maskRed);
+        inRange(hsv, Scalar(15, 150, 120), Scalar(38, 255, 255), maskYellow);
+        inRange(hsv, Scalar(40, 80, 80),   Scalar(95, 255, 255), maskGreen);
+
         Morphology(maskRed);
         Morphology(maskGreen);
         Morphology(maskYellow);
 
         const int minArea = 100;
-        Blob redBlob =findBlobByBBox(maskRed, minArea);           
-        Blob greenBlob = findBlobByBBox(maskGreen, minArea); 
-        Blob yellowBlob =findBlobByBBox(maskYellow, minArea); 
+        Blob redBlob    = findBlobByBBox(maskRed, minArea);
+        Blob greenBlob  = findBlobByBBox(maskGreen, minArea);
+        Blob yellowBlob = findBlobByBBox(maskYellow, minArea);
 
-        LightState raw =LightState:: Unknown;
-        if (redBlob.found && redBlob.area >= greenBlob.area && redBlob.area >= yellowBlob.area) raw = LightState::Red;
-        if (greenBlob.found  && greenBlob.area > redBlob.area && greenBlob.area >= yellowBlob.area) raw = LightState::Green;
-        if (yellowBlob.found && yellowBlob.area > redBlob.area && yellowBlob.area > greenBlob.area)  raw = LightState::Yellow;
-        double now = getTickCount() / getTickFrequency();
-        LightState state = debounce.update(raw, now);
+        Detection det = decide(redBlob, greenBlob, yellowBlob, minArea);
 
+        double now = static_cast<double>(getTickCount()) / getTickFrequency();
+        LightState state = validator.update(det.raw, now);
+
+        bool healthy = (state != LightState::Unknown);
+        sendTrafficLight(serial, state, healthy);
+
+        // 4. 画框（ROI 坐标 + 偏移）
         const Blob* best = nullptr;
         Scalar color;
-
         if (state == LightState::Red)         { best = &redBlob;    color = Scalar(0, 0, 255); }
         else if (state == LightState::Green)  { best = &greenBlob;  color = Scalar(0, 255, 0); }
         else if (state == LightState::Yellow) { best = &yellowBlob; color = Scalar(0, 255, 255); }
 
-        if (best && best->found) 
-         {// Rect drawBox = best->box + roi.tl();
-        // //  rectangle(img, drawBox, color, 2);
-        //     putText(img, toString(state),
-        //     Point(drawBox.x, max(drawBox.y - 8, 15)),
-        //     FONT_HERSHEY_SIMPLEX, 0.7, color, 2);
-            rectangle(img, best->box, color, 2);
-    putText(img, toString(state),
-        Point(best->box.x, max(best->box.y - 8, 15)),
-        FONT_HERSHEY_SIMPLEX, 0.7, color, 2);
+        if (best && best->found) {
+            Rect drawBox = best->box + roi.tl();
+            rectangle(img, drawBox, color, 2);
+            putText(img, toString(state),
+                    Point(drawBox.x, max(drawBox.y - 8, 15)),
+                    FONT_HERSHEY_SIMPLEX, 0.7, color, 2);
         }
 
-        putText(img, toString(state), Point(20, 40), FONT_HERSHEY_SIMPLEX, 1.2, Scalar(255, 255, 255), 2);
-        putText(img, format("FPS %.1f", fps), Point(20, 80), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 255, 0), 2);
+        // 5. 状态 + 时间 + FPS
+        putText(img, toString(state), Point(20, 40),
+                FONT_HERSHEY_SIMPLEX, 1.2, Scalar(255, 255, 255), 2);
+
+        bool safe = validator.safeToGo(now, t_cross + 0.3);
+        String info = format("age=%.1fs untilRedMin=%.1fs safe=%d",
+                             validator.stateAge(now),
+                             validator.timeUntilRedMin(now),
+                             safe ? 1 : 0);
+        putText(img, info, Point(20, 80),
+                FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 255, 0), 2);
 
         int64 t = getTickCount();
         int64 dt = t - t0;
-        if (dt > 0) 
-        {
+        if (dt > 0) {
             double inst = getTickFrequency() / double(dt);
             fps = (fps == 0.0) ? inst : 0.9 * fps + 0.1 * inst;
         }
         t0 = t;
+        putText(img, format("FPS %.1f", fps), Point(20, 115),
+                FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 255, 0), 2);
+
         imshow("img", img);
-        // imshow("red", maskRed);
-        // imshow("green", maskGreen);
-        // imshow("yellow", maskYellow);
-        // if ((waitKey(1) & 0xFF) == 27) break;
-        if (waitKey(1000/30) == 27) break;
+        if (waitKey(1000 / 30) == 27) break;
     }
-        destroyAllWindows();
-        return 0;
+
+    destroyAllWindows();
+    return 0;
 }
