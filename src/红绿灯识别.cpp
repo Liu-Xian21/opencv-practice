@@ -42,9 +42,6 @@ struct DotGrid {
 DotGrid detectDotGrid(const Mat& roiBgr)
 {
     DotGrid grid;
-if (det.raw == LightState::Unknown) {
-    grid = detectDotGrid(imgROI);   // 只有颜色失败时才跑
-}
 
     Mat gray;
     cvtColor(roiBgr, gray, COLOR_BGR2GRAY);
