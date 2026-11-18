@@ -3,24 +3,20 @@
 #include <vector>
 #include <string>
 #include <algorithm>
-
 #include "SerialPort.h"
-
 using namespace std;
 using namespace cv;
-
-// ===================== Blob =====================
 struct Blob {
     Rect box;
     double area = 0;
     bool found = false;
 };
 
-Blob findBlobByBBox(const Mat& mask, int minArea)
+Blob findBlobByBBox(const Mat& mask, int minArea)       //找像素然后拟框，不需要修改了吧。。
 {
     Blob result;
     vector<Point> pts;
-    findNonZero(mask, pts);
+    findNonZero(mask, pts);     //pts就是接收白色像素的坐标的，所以得知这是二值化图像
     if (pts.empty()) return result;
 
     Rect box = boundingRect(pts);
@@ -33,28 +29,30 @@ Blob findBlobByBBox(const Mat& mask, int minArea)
     return result;
 }
 
-// ===================== Detection =====================
-struct Detection {
-    LightState raw = LightState::Unknown;
+struct Detection 
+{
+    LightState raw = LightState::Unknown;       //原始状态是unknown。
     double confidence = 0.0;
     Rect box;
     const char* reason = "unknown";
 };
 
-Detection decide(const Blob& red, const Blob& green, const Blob& yellow, int minArea)
+Detection decide(const Blob& red, const Blob& green, const Blob& yellow, int minArea)       //这个我怎么看不懂。这个应该是辨别颜色的然后计入候选的
 {
     Detection d;
 
     struct Cand { bool ok; LightState s; double area; const Blob* b; };
-    Cand cands[3] = {
+    Cand cands[3] = 
+    {
         {red.found    && red.area    > minArea, LightState::Red,    red.area,    &red},
         {green.found  && green.area  > minArea, LightState::Green,  green.area,  &green},
         {yellow.found && yellow.area > minArea, LightState::Yellow, yellow.area, &yellow}
     };
 
-    Cand* best = nullptr;
-    Cand* second = nullptr;
-    for (auto& c : cands) {
+    Cand* best = nullptr;       //定义最佳颜色
+    Cand* second = nullptr;     //然后这个定义次佳颜色的
+    for (auto& c : cands) 
+    {
         if (!c.ok) continue;
         if (!best || c.area > best->area) { second = best; best = &c; }
         else if (!second || c.area > second->area) { second = &c; }
@@ -63,7 +61,8 @@ Detection decide(const Blob& red, const Blob& green, const Blob& yellow, int min
     if (!best) { d.reason = "no blob"; return d; }
 
     // 主色优势：最大 / 次大 必须 >= 1.5
-    if (second && best->area / second->area < 1.5) {
+    if (second && best->area / second->area < 1.5) 
+    {
         d.reason = "color ambiguous";
         return d;
     }
@@ -76,80 +75,98 @@ Detection decide(const Blob& red, const Blob& green, const Blob& yellow, int min
 }
 
 // ===================== SequenceValidator =====================
-class SequenceValidator {
-public:
-    explicit SequenceValidator(double holdSec = 0.15,
-                               double graceSec = 0.50,
-                               double unknownTimeoutSec = 1.0,
-                               double longHoldSec = 0.60)
-        : holdSec_(holdSec), graceSec_(graceSec),
-          unknownTimeoutSec_(unknownTimeoutSec), longHoldSec_(longHoldSec) {}
+class SequenceValidator 
+{
+    public:
+        explicit SequenceValidator(double holdSec = 0.15,       //正常的切换的防抖时间，看看可不可以修改
+                                   double graceSec = 0.50,      //短暂遮挡宽限时间，修改？
+                                   double unknownTimeoutSec = 1.0,      //长时间没有结果，过了这个时间就显示unknown
+                                   double longHoldSec = 0.60)           //非法跳变的容忍时间
+                                    : holdSec_(holdSec), graceSec_(graceSec),
+                                    unknownTimeoutSec_(unknownTimeoutSec), longHoldSec_(longHoldSec) {}
 
-    LightState update(LightState detected, double nowSec)
-    {
-        // 1. 没检测到：短暂宽限，长期超时
-        if (detected == LightState::Unknown) {
-            if (nowSec - lastValidTime_ < graceSec_)
+        LightState update(LightState detected, double nowSec)
+        {
+            // 1. 没检测到：短暂宽限，长期超时
+            if (detected == LightState::Unknown) 
+            {
+                if (nowSec - lastValidTime_ < graceSec_)
+                    return confirmed_;
+                if (nowSec - lastValidTime_ > unknownTimeoutSec_)
+                    setConfirmed(LightState::Unknown, nowSec);
                 return confirmed_;
-            if (nowSec - lastValidTime_ > unknownTimeoutSec_)
-                setConfirmed(LightState::Unknown, nowSec);
-            return confirmed_;
+            }
+
+            lastValidTime_ = nowSec;
+
+            // 2. 启动：第一个稳定检测直接接受
+            if (confirmed_ == LightState::Unknown)
+                return tryConfirm(detected, nowSec, holdSec_);
+
+            // 3. 和当前一致：保持
+            if (detected == confirmed_) 
+            {
+                candidate_ = detected;
+                candidateSince_ = nowSec;
+                return confirmed_;
+            }
+
+            // 4. 符合序列：正常切换
+            if (detected == nextState(confirmed_))
+                return tryConfirm(detected, nowSec, holdSec_);
+
+            // 5. 非法跳变：先忽略；持续 longHoldSec 才容忍
+            return tryConfirm(detected, nowSec, longHoldSec_);
         }
 
-        lastValidTime_ = nowSec;
+        double stateAge(double nowSec) const { return nowSec - stateSince_; }
 
-        // 2. 启动：第一个稳定检测直接接受
-        if (confirmed_ == LightState::Unknown)
-            return tryConfirm(detected, nowSec, holdSec_);
-
-        // 3. 和当前一致：保持
-        if (detected == confirmed_) {
-            candidate_ = detected;
-            candidateSince_ = nowSec;
-            return confirmed_;
+        // 距离"红灯开始"的最短/最长剩余时间（规则：绿 3~5s，黄 2s）
+        double timeUntilRedMin(double nowSec) const
+        {
+            double age = stateAge(nowSec);
+            switch (confirmed_) {
+                case LightState::Green:  return std::max(0.0, 3.0 - age) + 2.0;
+                case LightState::Yellow: return std::max(0.0, 2.0 - age);
+                case LightState::Red:    return 0.0;
+                default:                 return 0.0;
+            }
         }
 
-        // 4. 符合序列：正常切换
-        if (detected == nextState(confirmed_))
-            return tryConfirm(detected, nowSec, holdSec_);
-
-        // 5. 非法跳变：先忽略；持续 longHoldSec 才容忍
-        return tryConfirm(detected, nowSec, longHoldSec_);
-    }
-
-    double stateAge(double nowSec) const { return nowSec - stateSince_; }
-
-    // 距离"红灯开始"的最短/最长剩余时间（规则：绿 3~5s，黄 2s）
-    double timeUntilRedMin(double nowSec) const
-    {
-        double age = stateAge(nowSec);
-        switch (confirmed_) {
-            case LightState::Green:  return std::max(0.0, 3.0 - age) + 2.0;
-            case LightState::Yellow: return std::max(0.0, 2.0 - age);
-            case LightState::Red:    return 0.0;
-            default:                 return 0.0;
+        double timeUntilRedMax(double nowSec) const
+        {
+            double age = stateAge(nowSec);
+            switch (confirmed_) {
+                case LightState::Green:  return std::max(0.0, 5.0 - age) + 2.0;
+                case LightState::Yellow: return std::max(0.0, 2.0 - age);
+                case LightState::Red:    return 0.0;
+                default:                 return 0.0;
+            }
         }
-    }
 
-    double timeUntilRedMax(double nowSec) const
-    {
-        double age = stateAge(nowSec);
-        switch (confirmed_) {
-            case LightState::Green:  return std::max(0.0, 5.0 - age) + 2.0;
-            case LightState::Yellow: return std::max(0.0, 2.0 - age);
-            case LightState::Red:    return 0.0;
-            default:                 return 0.0;
+        // 只有"亲眼看到绿灯开始"且剩余时间足够，才允许起步
+        bool safeToGo(double nowSec, double requiredSec) const
+        {
+            if (confirmed_ != LightState::Green) return false;
+            if (!stateKnownFromStart_) return false;
+            return timeUntilRedMin(nowSec) >= requiredSec;
         }
-    }
 
-    // 只有"亲眼看到绿灯开始"且剩余时间足够，才允许起步
-    bool safeToGo(double nowSec, double requiredSec) const
-    {
-        if (confirmed_ != LightState::Green) return false;
-        if (!stateKnownFromStart_) return false;
-        return timeUntilRedMin(nowSec) >= requiredSec;
-    }
+        // 红灯时：距离下一个绿灯的最短/最长剩余时间
+        double timeUntilGreenMin(double nowSec) const
+        {
+            if (confirmed_ != LightState::Red) return 0.0;
+            return std::max(0.0, 3.0 - stateAge(nowSec));
+        }
 
+        double timeUntilGreenMax(double nowSec) const
+        {
+            if (confirmed_ != LightState::Red) return 0.0;
+            return std::max(0.0, 5.0 - stateAge(nowSec));
+        }
+
+// 是否"亲眼看到这个状态的开始"
+bool stateKnownFromStart() const { return stateKnownFromStart_; }
 private:
     void setConfirmed(LightState s, double nowSec)
     {
@@ -205,12 +222,24 @@ const char* toString(LightState s)
 // ===================== Morphology =====================
 void Morphology(Mat& mask)
 {
-    Mat kernel = getStructuringElement(MORPH_RECT, Size(5, 5));
-    Mat temp;
-    dilate(mask, temp, kernel);
-    erode(temp, mask, kernel);
+    Mat k9 = getStructuringElement(MORPH_RECT, Size(9, 9));
+    morphologyEx(mask, mask, MORPH_CLOSE, k9);
 }
+// void Morphology(Mat& mask)
+// {
+//     Mat kernel = getStructuringElement(MORPH_RECT, Size(5, 5));
+//     Mat temp;
+//     dilate(mask, temp, kernel);
+//     erode(temp, mask, kernel);
+//}
+// void Morphology(Mat& mask)
+// {
+//     Mat k3 = getStructuringElement(MORPH_RECT, Size(3, 3));
+//     Mat k9 = getStructuringElement(MORPH_RECT, Size(9, 9));
 
+//     morphologyEx(mask, mask, MORPH_OPEN,  k3);   // 先去小噪点
+//     morphologyEx(mask, mask, MORPH_CLOSE, k9);   // 再连 LED 点
+// }
 // ===================== main =====================
 int main()
 {
@@ -221,20 +250,33 @@ int main()
     }
 
     // 2. 视频
-    VideoCapture cap("/home/liu_xian/sample/assets/videos/practice.mp4");
+    VideoCapture cap("/home/liu_xian/sample/build/实践4.mp4");
+    // VideoCapture cap("/home/liu_xian/sample/build/0c290a9c41216ebcc64ad99976399cd5.mp4");
     if (!cap.isOpened()) {
         cerr << "视频打开失败\n";
         return -1;
     }
 
+    // const string url = "http://10.163.3.59:8080/video";
+    // vector<int> params = {
+    //     cv::CAP_PROP_OPEN_TIMEOUT_MSEC, 5000,
+    //     cv::CAP_PROP_READ_TIMEOUT_MSEC, 5000
+    // };
+    // VideoCapture cap(url, cv::CAP_FFMPEG, params);
+    // if (!cap.isOpened()) {
+    //     std::cerr << "Error1\n";
+    //     return -1;
+    // }
+    // cout << "已连接: " << cap.get(cv::CAP_PROP_FRAME_WIDTH) << "x"
+    //           << cap.get(cv::CAP_PROP_FRAME_HEIGHT) << "\n";
     Mat imgroi, img;
     const int TARGET_W = 640;
     double fps = 0.0;
     int64 t0 = getTickCount();
     int readFail = 0;
 
-    // 车从停车点到"完全进入隧道"的实测时间（秒），先填 2.0，之后按实车改
-    const double t_cross = 2.0;
+    
+    const double t_cross = 2.0;     // 车从停车点到"完全进入隧道"的实测时间先填，之后按实车改
 
     SequenceValidator validator;   // 0.15 / 0.50 / 1.0 / 0.60
 
@@ -259,6 +301,7 @@ int main()
         Mat imgROI = img(roi).clone();
 
         Mat hsv;
+        medianBlur(imgROI, imgROI, 3); 
         GaussianBlur(imgROI, imgROI, Size(5, 5), 0);
         cvtColor(imgROI, hsv, COLOR_BGR2HSV);
 
@@ -266,7 +309,8 @@ int main()
         inRange(hsv, Scalar(0,   130, 120), Scalar(8,   255, 255), maskRed1);
         inRange(hsv, Scalar(172, 130, 120), Scalar(180, 255, 255), maskRed2);
         bitwise_or(maskRed1, maskRed2, maskRed);
-        inRange(hsv, Scalar(15, 150, 120), Scalar(38, 255, 255), maskYellow);
+        inRange(hsv, Scalar(12, 60, 170), Scalar(35, 255, 255), maskYellow);
+                                                                                                                           
         inRange(hsv, Scalar(40, 80, 80),   Scalar(95, 255, 255), maskGreen);
 
         Morphology(maskRed);
@@ -305,26 +349,53 @@ int main()
         putText(img, toString(state), Point(20, 40),
                 FONT_HERSHEY_SIMPLEX, 1.2, Scalar(255, 255, 255), 2);
 
-        bool safe = validator.safeToGo(now, t_cross + 0.3);
-        String info = format("age=%.1fs untilRedMin=%.1fs safe=%d",
-                             validator.stateAge(now),
-                             validator.timeUntilRedMin(now),
-                             safe ? 1 : 0);
-        putText(img, info, Point(20, 80),
-                FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 255, 0), 2);
+        double age = validator.stateAge(now);
+        bool known = validator.stateKnownFromStart();
 
-        int64 t = getTickCount();
-        int64 dt = t - t0;
-        if (dt > 0) {
-            double inst = getTickFrequency() / double(dt);
-            fps = (fps == 0.0) ? inst : 0.9 * fps + 0.1 * inst;
+        String info;
+        if (state == LightState::Green) {
+            info = format("GREEN  age=%.1fs  remain=%.1f~%.1fs  %s",
+                        age,
+                        validator.timeUntilRedMin(now),
+                        validator.timeUntilRedMax(now),
+                        known ? "seen-start" : "mid-state");
         }
+        else if (state == LightState::Yellow) {
+            info = format("YELLOW age=%.1fs  remain=%.1fs  %s",
+                        age,
+                        validator.timeUntilRedMin(now),
+                        known ? "seen-start" : "mid-state");
+        }
+        else if (state == LightState::Red) {
+            info = format("RED    age=%.1fs  nextGreen=%.1f~%.1fs  %s",
+                        age,
+                        validator.timeUntilGreenMin(now),
+                        validator.timeUntilGreenMax(now),
+                        known ? "seen-start" : "mid-state");
+        }
+        else {
+            info = "UNKNOWN";
+        }
+        putText(img, info, Point(20, 80),
+                FONT_HERSHEY_SIMPLEX, 0.55, Scalar(0, 255, 0), 2);
+                int64 t = getTickCount();
+                int64 dt = t - t0;
+                if (dt > 0) 
+                {
+                    double inst = getTickFrequency() / double(dt);
+                    fps = (fps == 0.0) ? inst : 0.9 * fps + 0.1 * inst;
+                }
         t0 = t;
         putText(img, format("FPS %.1f", fps), Point(20, 115),
                 FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 255, 0), 2);
 
-        imshow("img", img);
-        if (waitKey(1000 / 30) == 27) break;
+         imshow("img", img);
+        // imshow("imgyellow",maskYellow);
+        // imshow("imgGreen",maskGreen);
+        //  imshow("imgRed",maskRed);
+
+        // if (waitKey(1000 / 30) == 27) break;
+        if (waitKey(1000 / cap.get(CAP_PROP_FPS)) == 27) break;
     }
 
     destroyAllWindows();
