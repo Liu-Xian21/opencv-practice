@@ -42,6 +42,9 @@ struct DotGrid {
 DotGrid detectDotGrid(const Mat& roiBgr)
 {
     DotGrid grid;
+if (det.raw == LightState::Unknown) {
+    grid = detectDotGrid(imgROI);   // 只有颜色失败时才跑
+}
 
     Mat gray;
     cvtColor(roiBgr, gray, COLOR_BGR2GRAY);
@@ -387,10 +390,10 @@ int main()
         resize(imgroi, img, Size(), s, s, INTER_AREA);
 
         // 3. ROI
-        Rect roi(static_cast<int>(img.cols * 0.10),
-                 static_cast<int>(img.rows * 0.10),
-                 static_cast<int>(img.cols * 0.80),
-                 static_cast<int>(img.rows * 0.80));
+        // ROI：左上到右下 3/4 区域
+        Rect roi(0, 0,
+                 static_cast<int>(img.cols * 3 / 4),
+                 static_cast<int>(img.rows * 3 / 4));
         roi &= Rect(0, 0, img.cols, img.rows);
         Mat imgROI = img(roi).clone();
 
@@ -418,13 +421,17 @@ int main()
 
         Detection det = decide(redBlob, greenBlob, yellowBlob, minArea);
 
-        DotGrid grid = detectDotGrid(imgROI);
-        if (grid.found) {
-            LightState gridState = classifyGridColor(hsv, grid);
-            if (det.raw == LightState::Unknown && gridState != LightState::Unknown) {
-                det.raw = gridState;
-                det.box = grid.box;
-                det.reason = "dot-grid";
+        // 点阵检测只在颜色路径 UNKNOWN 时跑，省算力
+        DotGrid grid;
+        if (det.raw == LightState::Unknown) {
+            grid = detectDotGrid(imgROI);
+            if (grid.found) {
+                LightState gridState = classifyGridColor(hsv, grid);
+                if (gridState != LightState::Unknown) {
+                    det.raw = gridState;
+                    det.box = grid.box;
+                    det.reason = "dot-grid";
+                }
             }
         }
 
