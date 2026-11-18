@@ -3,6 +3,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <cmath>
 #include "SerialPort.h"
 using namespace std;
 using namespace cv;
@@ -27,6 +28,99 @@ Blob findBlobByBBox(const Mat& mask, int minArea)       //找像素然后拟框�
         result.box   = box;
     }
     return result;
+}
+
+
+// ===================== LED 点阵圆点检测 =====================
+struct DotGrid {
+    bool found = false;
+    int count = 0;
+    Rect box;
+};
+
+// 在 ROI 里找"圆形亮斑"，用形状而不是颜色确认 LED 点阵
+DotGrid detectDotGrid(const Mat& roiBgr)
+{
+    DotGrid grid;
+
+    Mat gray;
+    cvtColor(roiBgr, gray, COLOR_BGR2GRAY);
+
+    Mat bin;
+    threshold(gray, bin, 180, 255, THRESH_BINARY);
+
+    vector<vector<Point>> contours;
+    findContours(bin, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+
+    vector<Point> centers;
+    float maxR = 0.0f;
+
+    for (auto& c : contours) {
+        double area = contourArea(c);
+        double peri = arcLength(c, true);
+        if (peri <= 0 || area < 5) continue;
+
+        // 圆度：4πA/P²，越接近 1 越圆
+        double circularity = 4.0 * CV_PI * area / (peri * peri);
+        if (circularity < 0.30) continue;
+
+        Point2f center;
+        float radius;
+        minEnclosingCircle(c, center, radius);
+        if (radius < 1.5f || radius > 20.0f) continue;
+
+        centers.emplace_back(cvRound(center.x), cvRound(center.y));
+        maxR = std::max(maxR, radius);
+    }
+
+    if ((int)centers.size() < 10) return grid;
+
+    Rect box = boundingRect(centers);
+    int m = std::max(2, (int)std::ceil(maxR));
+    box.x = std::max(0, box.x - m);
+    box.y = std::max(0, box.y - m);
+    box.width = std::min(roiBgr.cols - box.x, box.width + 2 * m);
+    box.height = std::min(roiBgr.rows - box.y, box.height + 2 * m);
+
+    grid.found = true;
+    grid.count = (int)centers.size();
+    grid.box = box;
+    return grid;
+}
+
+// 用点阵区域内的"主色相"判色，不依赖面积大小
+LightState classifyGridColor(const Mat& hsv, const DotGrid& grid)
+{
+    if (!grid.found) return LightState::Unknown;
+
+    Mat region = Mat::zeros(hsv.size(), CV_8UC1);
+    rectangle(region, grid.box, Scalar(255), FILLED);
+
+    // 只保留有颜色的亮像素，排除白色中心
+    Mat bright;
+    inRange(hsv, Scalar(0, 25, 120), Scalar(180, 255, 255), bright);
+    Mat m = region & bright;
+
+    if (countNonZero(m) < 20) return LightState::Unknown;
+
+    int histSize = 180;
+    float range[] = {0, 180};
+    const float* ranges[] = {&range[0]};
+    int channels[] = {0};
+    Mat hist;
+    calcHist(&hsv, 1, channels, m, hist, 1, &histSize, ranges);
+
+    Mat histS;
+    GaussianBlur(hist, histS, Size(5, 1), 0, 0, BORDER_REPLICATE);
+
+    Point maxLoc;
+    minMaxLoc(histS, nullptr, nullptr, nullptr, &maxLoc);
+    int domH = maxLoc.y;
+
+    if (domH <= 10 || domH >= 170) return LightState::Red;
+    if (domH <= 40) return LightState::Yellow;
+    if (domH <= 90) return LightState::Green;
+    return LightState::Unknown;
 }
 
 struct Detection 
@@ -324,6 +418,16 @@ int main()
 
         Detection det = decide(redBlob, greenBlob, yellowBlob, minArea);
 
+        DotGrid grid = detectDotGrid(imgROI);
+        if (grid.found) {
+            LightState gridState = classifyGridColor(hsv, grid);
+            if (det.raw == LightState::Unknown && gridState != LightState::Unknown) {
+                det.raw = gridState;
+                det.box = grid.box;
+                det.reason = "dot-grid";
+            }
+        }
+
         double now = static_cast<double>(getTickCount()) / getTickFrequency();
         LightState state = validator.update(det.raw, now);
 
@@ -343,6 +447,14 @@ int main()
             putText(img, toString(state),
                     Point(drawBox.x, max(drawBox.y - 8, 15)),
                     FONT_HERSHEY_SIMPLEX, 0.7, color, 2);
+        }
+
+        if (grid.found) {
+            Rect gb = grid.box + roi.tl();
+            rectangle(img, gb, Scalar(255, 255, 0), 2);
+            putText(img, "dots=" + to_string(grid.count),
+                    Point(gb.x, std::max(gb.y - 6, 12)),
+                    FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 0), 1);
         }
 
         // 5. 状态 + 时间 + FPS
