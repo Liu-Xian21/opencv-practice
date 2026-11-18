@@ -47,7 +47,7 @@ DotGrid detectDotGrid(const Mat& roiBgr)
     cvtColor(roiBgr, gray, COLOR_BGR2GRAY);
 
     Mat bin;
-    threshold(gray, bin, 180, 255, THRESH_BINARY);
+    threshold(gray, bin, 160, 255, THRESH_BINARY);
 
     vector<vector<Point>> contours;
     findContours(bin, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
@@ -62,18 +62,18 @@ DotGrid detectDotGrid(const Mat& roiBgr)
 
         // 圆度：4πA/P²，越接近 1 越圆
         double circularity = 4.0 * CV_PI * area / (peri * peri);
-        if (circularity < 0.30) continue;
+        if (circularity < 0.25) continue;
 
         Point2f center;
         float radius;
         minEnclosingCircle(c, center, radius);
-        if (radius < 1.5f || radius > 20.0f) continue;
+        if (radius < 1.0f || radius > 25.0f) continue;
 
         centers.emplace_back(cvRound(center.x), cvRound(center.y));
         maxR = std::max(maxR, radius);
     }
 
-    if ((int)centers.size() < 10) return grid;
+    if ((int)centers.size() < 8) return grid;
 
     Rect box = boundingRect(centers);
     int m = std::max(2, (int)std::ceil(maxR));
@@ -98,10 +98,10 @@ LightState classifyGridColor(const Mat& hsv, const DotGrid& grid)
 
     // 只保留有颜色的亮像素，排除白色中心
     Mat bright;
-    inRange(hsv, Scalar(0, 25, 120), Scalar(180, 255, 255), bright);
+    inRange(hsv, Scalar(0, 15, 100), Scalar(180, 255, 255), bright);
     Mat m = region & bright;
 
-    if (countNonZero(m) < 20) return LightState::Unknown;
+    if (countNonZero(m) < 15) return LightState::Unknown;
 
     int histSize = 180;
     float range[] = {0, 180};
@@ -393,6 +393,7 @@ int main()
                  static_cast<int>(img.rows * 3 / 4));
         roi &= Rect(0, 0, img.cols, img.rows);
         Mat imgROI = img(roi).clone();
+        rectangle(img, roi, Scalar(255, 0, 255), 1);   // 调试：画出 ROI
 
         Mat hsv;
         medianBlur(imgROI, imgROI, 3); 
@@ -403,7 +404,7 @@ int main()
         inRange(hsv, Scalar(0,   130, 120), Scalar(8,   255, 255), maskRed1);
         inRange(hsv, Scalar(172, 130, 120), Scalar(180, 255, 255), maskRed2);
         bitwise_or(maskRed1, maskRed2, maskRed);
-        inRange(hsv, Scalar(12, 60, 170), Scalar(35, 255, 255), maskYellow);
+        inRange(hsv, Scalar(10, 40, 150), Scalar(40, 255, 255), maskYellow);
                                                                                                                            
         inRange(hsv, Scalar(40, 80, 80),   Scalar(95, 255, 255), maskGreen);
 
@@ -411,7 +412,7 @@ int main()
         Morphology(maskGreen);
         Morphology(maskYellow);
 
-        const int minArea = 100;
+        const int minArea = 50;
         Blob redBlob    = findBlobByBBox(maskRed, minArea);
         Blob greenBlob  = findBlobByBBox(maskGreen, minArea);
         Blob yellowBlob = findBlobByBBox(maskYellow, minArea);
@@ -430,6 +431,14 @@ int main()
                     det.reason = "dot-grid";
                 }
             }
+        }
+
+        static int dbg = 0;
+        if (++dbg % 15 == 0) {
+            cout << "yellowArea=" << yellowBlob.area
+                 << " grid=" << grid.found << "/" << grid.count
+                 << " raw=" << static_cast<int>(det.raw)
+                 << " reason=" << det.reason << endl;
         }
 
         double now = static_cast<double>(getTickCount()) / getTickFrequency();
