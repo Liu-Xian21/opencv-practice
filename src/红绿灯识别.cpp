@@ -445,7 +445,15 @@ int main()
         LightState state = validator.update(det.raw, now);
 
         bool healthy = (state != LightState::Unknown);
-        sendTrafficLight(serial, state, healthy);
+
+        // 周期发送：默认 10Hz（0.1s）
+        // 电控读得慢（比如 0.5s 或 1s）就把 SEND_INTERVAL 改成对应值
+        const double SEND_INTERVAL = 0.1;
+        static double lastSend = 0.0;
+        if (now - lastSend >= SEND_INTERVAL) {
+            sendTrafficLight(serial, state, healthy);
+            lastSend = now;
+        }
 
         // 4. 画框（ROI 坐标 + 偏移）
         const Blob* best = nullptr;
@@ -520,7 +528,7 @@ int main()
         //  imshow("imgRed",maskRed);
 
         // if (waitKey(1000 / 30) == 27) break;
-        if (waitKey(1000 / cap.get(CAP_PROP_FPS)) == 27) break;
+        if (waitKey(1000 / cap.get(CAP_PROP_FPS)/0.5) == 27) break;
     }
 
     destroyAllWindows();
